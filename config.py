@@ -25,7 +25,8 @@ class SyncConfig:
 
 def load_config(dry_run: bool = False, require_drive: bool = True) -> SyncConfig:
     env_path = Path(__file__).resolve().parent / ".env"
-    load_dotenv(env_path, interpolate=False)
+    if env_path.exists():
+        load_dotenv(env_path, interpolate=False, override=True)
 
     raw_exts = os.getenv("ALLOWED_EXTENSIONS", ",".join(DEFAULT_EXTENSIONS))
     exts = tuple(

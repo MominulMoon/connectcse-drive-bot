@@ -10,6 +10,14 @@ import requests
 from bs4 import BeautifulSoup, Tag
 
 from config import SyncConfig
+from post_parser import (
+    PostContent,
+    RemoteAttachment,
+    extract_pagination_urls,
+    extract_post_urls,
+    parse_post_detail,
+    sanitize_filename,
+)
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -23,15 +31,6 @@ ALLOWED_MIME_TO_EXT = {
     "application/msword": ".doc",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
 }
-
-DOWNLOAD_HINT_RE = re.compile(r"(?:^|/)(download|attachments?|files?|storage|uploads)(?:/|$)", re.I)
-
-
-@dataclass(frozen=True)
-class RemoteAttachment:
-    url: str
-    filename: str
-    post_title: str
 
 
 @dataclass(frozen=True)
@@ -101,11 +100,11 @@ class ConnectCSEClient:
             raise RuntimeError("Session redirected to /login while fetching class posts.")
         return resp.url, resp.text
 
-    def discover_attachments(self, max_pages: int = 5) -> list[RemoteAttachment]:
+    def discover_posts(self, max_pages: int = 5) -> list[PostContent]:
         visited_pages: set[str] = set()
         pages_to_visit: list[str] = [self.config.posts_url]
-        seen_urls: set[str] = set()
-        found: list[RemoteAttachment] = []
+        post_urls: list[str] = []
+        seen_post_urls: set[str] = set()
 
         while pages_to_visit and len(visited_pages) < max_pages:
             page_url = pages_to_visit.pop(0)
@@ -114,35 +113,26 @@ class ConnectCSEClient:
             visited_pages.add(page_url)
 
             final_url, html = self.fetch_posts_html(page_url)
-            soup = BeautifulSoup(html, "html.parser")
+            for next_page in extract_pagination_urls(self.config.posts_url, html):
+                if next_page not in visited_pages and next_page not in pages_to_visit:
+                    pages_to_visit.append(next_page)
 
-            for anchor in soup.find_all("a", href=True):
-                href = str(anchor["href"]).strip()
-                if not href or href.startswith(("#", "javascript:", "mailto:")):
-                    continue
-                abs_url = urljoin(final_url, href)
+            for post_url in extract_post_urls(final_url, html):
+                if post_url not in seen_post_urls:
+                    seen_post_urls.add(post_url)
+                    post_urls.append(post_url)
 
-                if self._is_pagination_link(anchor, abs_url):
-                    if abs_url not in visited_pages and abs_url not in pages_to_visit:
-                        pages_to_visit.append(abs_url)
-                    continue
-
-                if abs_url in seen_urls:
-                    continue
-
-                if self._looks_like_attachment(anchor, abs_url):
-                    seen_urls.add(abs_url)
-                    filename = self._guess_filename(anchor, abs_url)
-                    post_title = self._extract_context_title(anchor)
-                    found.append(
-                        RemoteAttachment(
-                            url=abs_url,
-                            filename=filename,
-                            post_title=post_title,
-                        )
-                    )
-
-        return found
+        posts: list[PostContent] = []
+        for post_url in post_urls:
+            final_post_url, post_html = self.fetch_posts_html(post_url)
+            posts.append(
+                parse_post_detail(
+                    final_post_url,
+                    post_html,
+                    self.config.allowed_extensions,
+                )
+            )
+        return posts
 
     def download_attachment(self, item: RemoteAttachment) -> DownloadedFile | None:
         resp = self.session.get(item.url, timeout=60, allow_redirects=True)
@@ -159,7 +149,6 @@ class ConnectCSEClient:
             mapped_ext = ALLOWED_MIME_TO_EXT.get(content_type)
             if mapped_ext and mapped_ext in self.config.allowed_extensions:
                 filename = f"{filename}{mapped_ext}"
-                ext = mapped_ext
             else:
                 return None
 
@@ -172,92 +161,26 @@ class ConnectCSEClient:
         )
 
     def inspect_page(self) -> str:
-        final_url, html = self.fetch_posts_html()
-        soup = BeautifulSoup(html, "html.parser")
-        lines = [f"Final URL: {final_url}", f"Page title: {soup.title.string.strip() if soup.title and soup.title.string else '(none)'}"]
-        anchors = soup.find_all("a", href=True)
-        lines.append(f"Total links on page: {len(anchors)}")
-
-        shown = 0
-        for anchor in anchors:
-            href = str(anchor["href"]).strip()
-            abs_url = urljoin(final_url, href)
-            text = " ".join(anchor.get_text(" ", strip=True).split())[:80]
-            if self._looks_like_attachment(anchor, abs_url) or "classpost" in abs_url.lower():
-                lines.append(f"  - text={text!r} | href={abs_url}")
-                shown += 1
-                if shown >= 40:
-                    break
-
-        if shown == 0:
-            lines.append("No obvious attachment or classpost links matched. Sample links:")
-            for anchor in anchors[:20]:
-                href = urljoin(final_url, str(anchor["href"]).strip())
-                text = " ".join(anchor.get_text(" ", strip=True).split())[:60]
-                lines.append(f"  - text={text!r} | href={href}")
-
+        posts = self.discover_posts(max_pages=2)
+        lines = [f"Discovered {len(posts)} post detail page(s):"]
+        for post in posts:
+            lines.append(f"\n[{post.title}] {post.post_url}")
+            for att in post.attachments:
+                lines.append(f"  FILE: {att.filename} -> {att.url}")
+            for link in post.shared_links:
+                kind = f"DRIVE({link.drive_id})" if link.drive_id else "LINK"
+                lines.append(f"  {kind}: {link.label} -> {link.url}")
         return "\n".join(lines)
-
-    def _is_pagination_link(self, anchor: Tag, abs_url: str) -> bool:
-        parsed = urlparse(abs_url)
-        posts_parsed = urlparse(self.config.posts_url)
-        if parsed.netloc != posts_parsed.netloc or parsed.path != posts_parsed.path:
-            return False
-        if "page=" in parsed.query:
-            return True
-        rel = anchor.get("rel") or []
-        return "next" in rel
-
-    def _looks_like_attachment(self, anchor: Tag, abs_url: str) -> bool:
-        parsed = urlparse(abs_url)
-        path_lower = unquote(parsed.path).lower()
-        if any(path_lower.endswith(ext) for ext in self.config.allowed_extensions):
-            return True
-        if anchor.has_attr("download"):
-            return True
-        text = " ".join(anchor.get_text(" ", strip=True).split()).lower()
-        if any(text.endswith(ext) for ext in self.config.allowed_extensions):
-            return True
-        if parsed.netloc == urlparse(self.config.base_url).netloc and DOWNLOAD_HINT_RE.search(path_lower):
-            if not path_lower.endswith((".css", ".js", ".png", ".jpg", ".jpeg", ".svg", ".ico")):
-                return True
-        return False
-
-    def _guess_filename(self, anchor: Tag, abs_url: str) -> str:
-        if anchor.get("download"):
-            dl = str(anchor["download"]).strip()
-            if dl:
-                return _sanitize_filename(dl)
-        path_name = unquote(PurePosixPath(urlparse(abs_url).path).name)
-        if path_name and "." in path_name:
-            return _sanitize_filename(path_name)
-        text = " ".join(anchor.get_text(" ", strip=True).split())
-        if text:
-            return _sanitize_filename(text)
-        return "attachment"
 
     def _filename_from_response(self, resp: requests.Response, fallback: str) -> str:
         disposition = resp.headers.get("Content-Disposition", "")
         match = re.search(r"filename\*=UTF-8''([^;]+)", disposition, re.I)
         if match:
-            return _sanitize_filename(unquote(match.group(1).strip('"')))
+            return sanitize_filename(unquote(match.group(1).strip('"')))
         match = re.search(r'filename="?([^";]+)"?', disposition, re.I)
         if match:
-            return _sanitize_filename(unquote(match.group(1).strip()))
+            return sanitize_filename(unquote(match.group(1).strip()))
         final_name = unquote(PurePosixPath(urlparse(resp.url).path).name)
         if final_name and "." in final_name:
-            return _sanitize_filename(final_name)
-        return _sanitize_filename(fallback)
-
-    def _extract_context_title(self, anchor: Tag) -> str:
-        card = anchor.find_parent(class_=re.compile(r"(card|post|item|list-group-item)", re.I))
-        if card:
-            heading = card.find(["h1", "h2", "h3", "h4", "h5", "strong"])
-            if heading:
-                return " ".join(heading.get_text(" ", strip=True).split())[:100]
-        return ""
-
-
-def _sanitize_filename(name: str) -> str:
-    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip().strip(".")
-    return cleaned[:180] or "attachment"
+            return sanitize_filename(final_name)
+        return sanitize_filename(fallback)

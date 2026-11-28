@@ -13,12 +13,20 @@ DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
 TOKEN_URI = "https://oauth2.googleapis.com/token"
 FILES_URI = "https://www.googleapis.com/drive/v3/files"
 UPLOAD_URI = "https://www.googleapis.com/upload/drive/v3/files"
+SHORTCUT_MIME = "application/vnd.google-apps.shortcut"
 
 
 @dataclass(frozen=True)
 class ExistingDriveIndex:
     source_urls: set[str]
     filenames: set[str]
+
+
+@dataclass(frozen=True)
+class DriveShortcutRequest:
+    name: str
+    target_id: str
+    source_url: str
 
 
 class GoogleDriveUploader:
@@ -109,5 +117,24 @@ class GoogleDriveUploader:
             data=body,
             timeout=120,
         )
+        resp.raise_for_status()
+        return str(resp.json()["id"])
+
+    def create_shortcut(self, item: DriveShortcutRequest) -> str | None:
+        metadata = {
+            "name": item.name,
+            "mimeType": SHORTCUT_MIME,
+            "parents": [self.folder_id],
+            "shortcutDetails": {"targetId": item.target_id},
+            "appProperties": {"source_url": item.source_url},
+        }
+        resp = self.session.post(
+            FILES_URI,
+            params={"fields": "id, name"},
+            json=metadata,
+            timeout=30,
+        )
+        if resp.status_code in (403, 404):
+            return None
         resp.raise_for_status()
         return str(resp.json()["id"])
