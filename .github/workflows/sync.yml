@@ -2,8 +2,8 @@ name: Sync ConnectCSE to Google Drive
 
 on:
   schedule:
-    # Runs every 30 minutes (free on GitHub Actions)
-    - cron: "*/30 * * * *"
+    # Runs every 5 hours (00:00, 05:00, 10:00, 15:00, 20:00 UTC)
+    - cron: "0 */5 * * *"
   workflow_dispatch:
 
 jobs:
