@@ -39,6 +39,7 @@ class SharedLink:
 class PostContent:
     post_url: str
     title: str
+    course: str
     attachments: tuple[RemoteAttachment, ...]
     shared_links: tuple[SharedLink, ...]
 
@@ -103,6 +104,7 @@ def parse_post_detail(
 
     heading = content_col.find(["h5", "h4", "h3", "h2", "h1"])
     title = " ".join(heading.get_text(" ", strip=True).split()) if heading else "Class Post"
+    course = _extract_course_name(content_col)
 
     base_host = urlparse(post_url).netloc
     attachments: list[RemoteAttachment] = []
@@ -184,6 +186,7 @@ def parse_post_detail(
     return PostContent(
         post_url=post_url,
         title=title,
+        course=course,
         attachments=tuple(attachments),
         shared_links=tuple(shared_links),
     )
@@ -222,6 +225,16 @@ def _guess_filename(anchor: Tag, abs_url: str) -> str:
     if text and text.lower() != "download":
         return sanitize_filename(text)
     return "attachment"
+
+
+def _extract_course_name(container: Tag) -> str:
+    book_icon = container.select_one(".cp-meta-chip .fa-book")
+    chip = book_icon.parent if book_icon else None
+    if not isinstance(chip, Tag):
+        return ""
+    # Direct text nodes exclude the nested "(CSE XXXX)" code span.
+    parts = [str(node).strip() for node in chip.contents if isinstance(node, str) and str(node).strip()]
+    return sanitize_filename(" ".join(parts)) if parts else ""
 
 
 def _extract_link_label(anchor: Tag, fallback: str) -> str:

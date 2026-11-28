@@ -15,7 +15,7 @@ from post_parser import PostContent, SharedLink, build_links_html, sanitize_file
 class SyncContext:
     portal: ConnectCSEClient
     drive: GoogleDriveUploader
-    existing: ExistingDriveIndex
+    existing_by_folder: dict[str, ExistingDriveIndex]
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,28 +42,38 @@ def parse_args() -> argparse.Namespace:
 
 
 def sync_post(post: PostContent, ctx: SyncContext) -> tuple[int, int]:
+    if not post.attachments and not post.shared_links:
+        return 0, 0
+
+    folder_id = ctx.drive.get_or_create_subfolder(post.course) if post.course else ctx.drive.folder_id
+    existing = ctx.existing_by_folder.get(folder_id)
+    if existing is None:
+        existing = ctx.drive.list_existing(folder_id)
+        ctx.existing_by_folder[folder_id] = existing
+
+    folder_label = post.course or "root"
     uploaded = 0
     skipped = 0
 
     for item in post.attachments:
-        if item.url in ctx.existing.source_urls:
+        if item.url in existing.source_urls:
             skipped += 1
             continue
 
         downloaded = ctx.portal.download_attachment(item)
-        if downloaded is None or downloaded.filename in ctx.existing.filenames:
+        if downloaded is None or downloaded.filename in existing.filenames:
             skipped += 1
             continue
 
-        file_id = ctx.drive.upload_file(downloaded)
-        ctx.existing.source_urls.add(downloaded.source_url)
-        ctx.existing.filenames.add(downloaded.filename)
+        file_id = ctx.drive.upload_file(downloaded, folder_id)
+        existing.source_urls.add(downloaded.source_url)
+        existing.filenames.add(downloaded.filename)
         uploaded += 1
-        print(f"Uploaded file: {downloaded.filename} (Drive ID: {file_id})")
+        print(f"Uploaded file [{folder_label}]: {downloaded.filename} (Drive ID: {file_id})")
 
     fallback_links: list[SharedLink] = []
     for link in post.shared_links:
-        if link.url in ctx.existing.source_urls:
+        if link.url in existing.source_urls:
             skipped += 1
             continue
 
@@ -71,7 +81,7 @@ def sync_post(post: PostContent, ctx: SyncContext) -> tuple[int, int]:
             shortcut_name = sanitize_filename(
                 f"{post.title} - {link.label}" if link.label != post.title else post.title
             )
-            if shortcut_name in ctx.existing.filenames:
+            if shortcut_name in existing.filenames:
                 skipped += 1
                 continue
             shortcut_id = ctx.drive.create_shortcut(
@@ -79,13 +89,14 @@ def sync_post(post: PostContent, ctx: SyncContext) -> tuple[int, int]:
                     name=shortcut_name,
                     target_id=link.drive_id,
                     source_url=link.url,
-                )
+                ),
+                folder_id,
             )
             if shortcut_id:
-                ctx.existing.source_urls.add(link.url)
-                ctx.existing.filenames.add(shortcut_name)
+                existing.source_urls.add(link.url)
+                existing.filenames.add(shortcut_name)
                 uploaded += 1
-                print(f"Created Drive shortcut: {shortcut_name} (Drive ID: {shortcut_id})")
+                print(f"Created Drive shortcut [{folder_label}]: {shortcut_name} (Drive ID: {shortcut_id})")
                 continue
 
         fallback_links.append(link)
@@ -93,7 +104,7 @@ def sync_post(post: PostContent, ctx: SyncContext) -> tuple[int, int]:
     if fallback_links:
         note_key = f"{post.post_url}#links"
         note_name = f"{sanitize_filename(post.title)} - Links.html"
-        if note_key in ctx.existing.source_urls or note_name in ctx.existing.filenames:
+        if note_key in existing.source_urls or note_name in existing.filenames:
             skipped += len(fallback_links)
         else:
             note_file = DownloadedFile(
@@ -102,11 +113,11 @@ def sync_post(post: PostContent, ctx: SyncContext) -> tuple[int, int]:
                 mime_type="text/html",
                 content=build_links_html(post, fallback_links),
             )
-            file_id = ctx.drive.upload_file(note_file)
-            ctx.existing.source_urls.add(note_key)
-            ctx.existing.filenames.add(note_name)
+            file_id = ctx.drive.upload_file(note_file, folder_id)
+            existing.source_urls.add(note_key)
+            existing.filenames.add(note_name)
             uploaded += 1
-            print(f"Uploaded links note: {note_name} (Drive ID: {file_id})")
+            print(f"Uploaded links note [{folder_label}]: {note_name} (Drive ID: {file_id})")
 
     return uploaded, skipped
 
@@ -134,7 +145,8 @@ def main() -> int:
         for post in posts:
             if not post.attachments and not post.shared_links:
                 continue
-            print(f"\n[{post.title}] {post.post_url}")
+            folder = post.course or "root"
+            print(f"\n[{folder}] {post.title} ({post.post_url})")
             for att in post.attachments:
                 print(f"  FILE: {att.filename} -> {att.url}")
             for link in post.shared_links:
@@ -143,13 +155,7 @@ def main() -> int:
         return 0
 
     drive = GoogleDriveUploader(config)
-    existing = drive.list_existing()
-    print(
-        f"Drive folder already has {len(existing.filenames)} item(s) "
-        f"({len(existing.source_urls)} tracked by source URL)."
-    )
-
-    ctx = SyncContext(portal=portal, drive=drive, existing=existing)
+    ctx = SyncContext(portal=portal, drive=drive, existing_by_folder={})
     uploaded = 0
     skipped = 0
     for post in posts:
